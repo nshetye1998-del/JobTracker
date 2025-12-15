@@ -1,0 +1,4 @@
+# OAuth Token Cache (Example)
+# This file will be generated after running authenticate_outlook.py
+# Do not commit the actual token file to version control
+# See outlook_token_cache.json.example for structure

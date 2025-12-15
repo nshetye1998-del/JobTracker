@@ -1,0 +1,397 @@
+version: '3.8'
+
+# ═══════════════════════════════════════════════════════════════
+# PRODUCTION DOCKER COMPOSE
+# ═══════════════════════════════════════════════════════════════
+# This configuration uses persistent volumes that SURVIVE all rebuilds
+# Production data is stored in: /Users/nikunjshetye/job-tracker-production
+# NEVER run `docker-compose down -v` on this file!
+# ═══════════════════════════════════════════════════════════════
+
+x-common-env: &common-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  POSTGRES_HOST: postgres
+  POSTGRES_DB: job_tracker_prod
+  POSTGRES_USER: admin
+  POSTGRES_PASSWORD: secure_password
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: minio_admin
+  MINIO_SECRET_KEY: minio_password
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  ENVIRONMENT: production
+
+services:
+  # ---------------------------------------------------------------------------
+  # Core Infrastructure: Message Bus (Kafka + Zookeeper)
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_prod:/var/lib/zookeeper
+    healthcheck:
+      test: echo srvr | nc zookeeper 2181 || exit 1
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka_prod:/var/lib/kafka
+    healthcheck:
+      test: nc -z localhost 9092 || exit 1
+      interval: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Core Infrastructure: PRODUCTION Database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secure_password
+      POSTGRES_DB: job_tracker_prod
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_prod:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U admin" ]
+      interval: 10s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio_admin
+      MINIO_ROOT_PASSWORD: minio_password
+    volumes:
+      - minio_prod:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 30s
+      retries: 3
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_prod:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Microservices: Email Ingestion
+  # ---------------------------------------------------------------------------
+  ingestion:
+    build:
+      context: ../
+      dockerfile: services/ingestion/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: ingestion
+    volumes:
+      - ../outlook_token_cache.json:/app/outlook_token_cache.json:ro
+      - ../services/ingestion/credentials.json:/app/credentials.json
+      - ../services/ingestion/token.pickle:/app/token.pickle
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/metrics')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Microservices: AI Classification (with multi-provider support)
+  # ---------------------------------------------------------------------------
+  classifier:
+    build:
+      context: ../
+      dockerfile: services/classifier/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: classifier
+      # Multi-provider API keys (ALL FREE!)
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      HUGGINGFACE_TOKEN: ${HUGGINGFACE_TOKEN}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # Daily limits (configured in provider_manager.py)
+      GROQ_DAILY_LIMIT: 14400
+      OPENROUTER_DAILY_LIMIT: 1000
+      HUGGINGFACE_DAILY_LIMIT: 24000
+      GEMINI_DAILY_LIMIT: 1500
+    command: [ "python", "-u", "src/main.py" ]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Microservices: Research
+  # ---------------------------------------------------------------------------
+  researcher:
+    build:
+      context: ../
+      dockerfile: services/researcher/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: researcher
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      GOOGLE_CUSTOM_SEARCH_API_KEY: ${GOOGLE_CUSTOM_SEARCH_API_KEY}
+      GOOGLE_CUSTOM_SEARCH_CX: ${GOOGLE_CUSTOM_SEARCH_CX}
+      SERPAPI_KEY: ${SERPAPI_KEY}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/metrics')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # Microservices: Notifications
+  # ---------------------------------------------------------------------------
+  notifier:
+    build:
+      context: ../
+      dockerfile: services/notifier/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: notifier
+      # Twilio WhatsApp Configuration (ACTIVE)
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM}
+      TWILIO_WHATSAPP_TO: ${TWILIO_WHATSAPP_TO}
+      TWILIO_ORDER_UPDATE_TEMPLATE_SID: ${TWILIO_ORDER_UPDATE_TEMPLATE_SID}
+      TWILIO_ORDER_UPDATE_TEMPLATE_NAME: ${TWILIO_ORDER_UPDATE_TEMPLATE_NAME}
+      # Facebook WhatsApp (DISABLED)
+      # WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN}
+      # WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID}
+      # WHATSAPP_RECIPIENT_PHONE: ${WHATSAPP_RECIPIENT_PHONE}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Microservices: Dashboard
+  # ---------------------------------------------------------------------------
+  dashboard-api:
+    build:
+      context: ../
+      dockerfile: services/dashboard-api/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: dashboard-api
+      DATABASE_URL: postgresql://admin:secure_password@postgres:5432/job_tracker_prod
+      KAFKA_GROUP_ID: dashboard_group
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  dashboard-ui:
+    build:
+      context: ../
+      dockerfile: services/dashboard-ui/Dockerfile
+    depends_on:
+      dashboard-api:
+        condition: service_started
+    ports:
+      - "3300:80"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Microservices: Orchestration
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: ../
+      dockerfile: services/orchestrator/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      SERVICE_NAME: orchestrator
+    ports:
+      - "8005:8000"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Microservices: Conversation
+  # ---------------------------------------------------------------------------
+  conversation:
+    build:
+      context: ../
+      dockerfile: services/conversation/Dockerfile
+    environment:
+      <<: *common-env
+      SERVICE_NAME: conversation
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      LLM_PROVIDER: auto
+      WHATSAPP_VERIFY_TOKEN: my_secure_token
+    ports:
+      - "8004:8004"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Monitoring: Prometheus & Grafana
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_prod:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    depends_on:
+      - orchestrator
+      - conversation
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_prod:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+# ═══════════════════════════════════════════════════════════════
+# PRODUCTION VOLUMES (PERSISTENT)
+# ═══════════════════════════════════════════════════════════════
+# These volumes use bind mounts to /Users/nikunjshetye/job-tracker-production
+# Data SURVIVES all docker-compose down/up cycles
+# Only manual deletion can remove this data
+# ═══════════════════════════════════════════════════════════════
+
+volumes:
+  postgres_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/postgres
+      o: bind
+  
+  redis_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/redis
+      o: bind
+  
+  kafka_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/kafka
+      o: bind
+  
+  zookeeper_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/zookeeper
+      o: bind
+  
+  minio_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/minio
+      o: bind
+  
+  prometheus_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/prometheus
+      o: bind
+  
+  grafana_prod:
+    driver: local
+    driver_opts:
+      type: none
+      device: /Users/nikunjshetye/job-tracker-production/grafana
+      o: bind

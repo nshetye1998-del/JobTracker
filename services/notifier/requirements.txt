@@ -1,0 +1,7 @@
+kafka-python
+requests
+pydantic
+pydantic-settings
+structlog
+python-json-logger
+twilio==8.10.0
